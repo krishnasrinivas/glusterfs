@@ -505,7 +505,8 @@ rpcsvc_handle_rpc_call (rpcsvc_t *svc, rpc_transport_t *trans,
                         }
                 } else if (actor->actor) {
                         ret = actor->actor (req);
-                }
+                } else
+                        gf_log (GF_RPCSVC, GF_LOG_ERROR, "actor not present");
         }
 
 err_reply:
@@ -845,6 +846,71 @@ rpcsvc_callback_submit (rpcsvc_t *rpc, rpc_transport_t *trans,
         req.msg.rpchdrcount = 1;
         req.msg.proghdr = proghdr;
         req.msg.proghdrcount = proghdrcount;
+
+        ret = rpc_transport_submit_request (trans, &req);
+        if (ret == -1) {
+                gf_log ("rpcsvc", GF_LOG_WARNING,
+                        "transmission of rpc-request failed");
+                goto out;
+        }
+
+        ret = 0;
+
+out:
+        iobuf_unref (request_iob);
+
+        return ret;
+}
+
+int __callid;
+
+int
+rpcsvc_get_new_callid(rpcsvc_t *rpc)
+{
+        return ++__callid;
+}
+
+int
+rpcsvc_submit_request (rpcsvc_t *rpc, rpc_transport_t *trans,
+                       rpcsvc_program_t *prog, int procnum,
+                       struct iovec *proghdr, int proghdrcount,
+                       struct iobref *iobref)
+{
+        struct iobuf          *request_iob = NULL;
+        struct iovec           rpchdr      = {0,};
+        rpc_transport_req_t    req;
+        int                    ret         = -1;
+        int                    proglen     = 0;
+        uint64_t               callid      = 0;
+
+        if (!rpc) {
+                goto out;
+        }
+
+        memset (&req, 0, sizeof (req));
+
+        callid = rpcsvc_get_new_callid (rpc);
+
+        if (proghdr) {
+                proglen += iov_length (proghdr, proghdrcount);
+        }
+
+        request_iob = rpcsvc_callback_build_record (rpc, prog->prognum,
+                                                    prog->progver, procnum,
+                                                    proglen, callid,
+                                                    &rpchdr);
+        if (!request_iob) {
+                gf_log ("rpcsvc", GF_LOG_WARNING,
+                        "cannot build rpc-record");
+                goto out;
+        }
+        iobref_add (iobref, request_iob);
+
+        req.msg.rpchdr = &rpchdr;
+        req.msg.rpchdrcount = 1;
+        req.msg.proghdr = proghdr;
+        req.msg.proghdrcount = proghdrcount;
+        req.msg.iobref = iobref;
 
         ret = rpc_transport_submit_request (trans, &req);
         if (ret == -1) {

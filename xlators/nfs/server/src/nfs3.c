@@ -5490,6 +5490,7 @@ nfs3_init_state (xlator_t *nfsx)
                 goto free_localpool;
         }
 
+        nfs->nfs3state = nfs3;
         ret = 0;
 
 free_localpool:

@@ -63,6 +63,8 @@ struct nfs_state {
         rpcsvc_t                *rpcsvc;
         struct list_head        versions;
         struct mount3_state     *mstate;
+        struct nfs3_state       *nfs3state;
+        struct nlm4_state       *nlm4state;
         struct mem_pool         *foppool;
         unsigned int            memfactor;
         xlator_list_t           *subvols;
@@ -96,6 +98,7 @@ typedef struct nfs_user_info {
         uid_t   uid;
         gid_t   gids[NFS_NGROUPS];
         int     ngrps;
+        uint32_t lk_owner;
 } nfs_user_t;
 
 extern int

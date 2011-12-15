@@ -559,5 +559,10 @@ rpcsvc_volume_allowed (dict_t *options, char *volname);
 rpcsvc_vector_sizer
 rpcsvc_get_program_vector_sizer (rpcsvc_t *svc, uint32_t prognum,
                                  uint32_t progver, uint32_t procnum);
+int
+rpcsvc_submit_request (rpcsvc_t *rpc, rpc_transport_t *trans,
+                       rpcsvc_program_t *prog, int procnum,
+                       struct iovec *proghdr, int proghdrcount,
+                       struct iobref *iobref);
 
 #endif
