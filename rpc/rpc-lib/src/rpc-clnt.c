@@ -1231,7 +1231,7 @@ rpc_clnt_record_build_record (struct rpc_clnt *clnt, int prognum, int progver,
         record = iobuf_ptr (request_iob);  /* Now we have it. */
 
         /* Fill the rpc structure and XDR it into the buffer got above. */
-        if (!strcmp("socket.NLM", clnt->conn.trans->name))
+        if (!strcmp("NLM-client", clnt->conn.trans->name))
         ret = rpc_clnt_fill_request (prognum, progver, procnum, payload, xid,
                                      au, &request, NULL);
         else

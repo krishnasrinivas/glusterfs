@@ -134,6 +134,8 @@ typedef struct nfs3_state {
         struct list_head        fdlru;
         gf_lock_t               fdlrulock;
         int                     fdcount;
+        dict_t                  *nlm_cbk_clnt;
+        struct rpc_clnt *rpc_clnt;
 } nfs3_state_t;
 
 typedef enum nfs3_lookup_type {
@@ -232,6 +234,8 @@ struct nfs3_local {
         char                    cookiebytes[1024];
         struct nfs3_fh          lockfh;
         rpc_transport_t         *trans;
+        /* not being freed */
+        call_frame_t            *frame;
 };
 
 #define nfs3_is_revalidate_lookup(cst) ((cst)->lookuptype == GF_NFS3_REVALIDATE)

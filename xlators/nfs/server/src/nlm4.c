@@ -23,6 +23,7 @@
 #include "nfs-generics.h"
 #include "rpc-clnt.h"
 #include <unistd.h>
+#include <rpc/pmap_clnt.h>
 
 typedef ssize_t (*nlm4_serializer) (struct iovec outmsg, void *args);
 extern void
@@ -528,22 +529,103 @@ int
 nlm4svc_send_granted_cbk (struct rpc_req *req, struct iovec *iov, int count,
                           void *myframe)
 {
+        // destroy the frame
         return 0;
 }
 
 void
-nlm4svc_send_granted (nfs3_call_state_t *cs, call_frame_t *frame)
+nlm4svc_send_granted (nfs3_call_state_t *cs);
+
+void *
+nlm4_establish_callback (void *csarg)
+{
+        nfs3_call_state_t *cs;
+        struct sockaddr_storage sa;
+        struct sockaddr_in *sin;
+        dict_t *options = NULL;
+        char *peerip = NULL, *portstr;
+        rpc_clnt_t *rpc_clnt;
+        int port;
+        int ret;
+
+        cs = (nfs3_call_state_t *) csarg;
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+        sin = (struct sockaddr_in*) &sa;
+        peerip = inet_ntoa (sin->sin_addr);
+        port = pmap_getport (sin, NLM_PROGRAM, NLM_V4, IPPROTO_TCP);
+
+        options = dict_new();
+        ret = dict_set_str (options, "transport-type", "socket");
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto err;
+        }
+
+        ret = dict_set_dynstr (options, "remote-host", strdup (peerip));
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto err;
+        }
+
+        ret = gf_asprintf (&portstr, "%d", port);
+        if (ret == -1)
+                goto err;
+
+        ret = dict_set_dynstr (options, "remote-port",
+                               portstr);
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
+                goto err;
+        }
+
+        ret = dict_set_str (options, "non-blocking-io", "off");
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
+                goto err;
+        }
+
+        rpc_clnt = rpc_clnt_new (options, cs->nfsx->ctx, "NLM-client");
+        rpc_transport_connect (rpc_clnt->conn.trans, port);
+        rpc_clnt_set_connected (&rpc_clnt->conn);
+        cs->nfs3state->rpc_clnt = rpc_clnt;
+        ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip, &rpc_clnt);
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_ptr error");
+                goto err;
+        }
+        nlm4svc_send_granted (cs);
+err:
+        return NULL;
+}
+
+void
+nlm4svc_send_granted (nfs3_call_state_t *cs)
 {
         int ret = -1;
-        rpc_clnt_t *rpc_clnt;
+        rpc_clnt_t *rpc_clnt = NULL;
         struct iovec            outmsg = {0, };
         nlm4_testargs testargs;
         struct iobuf *iobuf;
         struct iobref *iobref;
         struct nfs_state *nfs;
+        char *peerip;
+        pthread_t thr;
+        struct sockaddr_storage sa;
+        struct sockaddr_in *sin;
 
         nfs = cs->nfsx->private;
-        rpc_clnt = nfs->rpc_clnt;
+
+
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+        sin = (struct sockaddr_in *) &sa;
+        peerip = inet_ntoa (sin->sin_addr);
+        ret = dict_get_ptr (cs->nfs3state->nlm_cbk_clnt, peerip, (void *) &rpc_clnt);
+        if (ret != 0) {
+                pthread_create (&thr, NULL, nlm4_establish_callback, (void*)cs);
+                return;
+        }
+//        rpc_clnt = cs->nfs3state->rpc_clnt;
+
         testargs.cookie = cs->args.nlm4_lockargs.cookie;
         testargs.exclusive = cs->args.nlm4_lockargs.exclusive;
         testargs.alock = cs->args.nlm4_lockargs.alock;
@@ -572,7 +654,7 @@ nlm4svc_send_granted (nfs3_call_state_t *cs, call_frame_t *frame)
                                nlm4svc_send_granted_cbk,
                                &outmsg, 1,
                                NULL,
-                               0, iobref, frame, NULL, 0,
+                               0, iobref, cs->frame, NULL, 0,
                                NULL, 0, NULL);
 
         if (ret < 0) {
@@ -580,6 +662,7 @@ nlm4svc_send_granted (nfs3_call_state_t *cs, call_frame_t *frame)
                 goto ret;
         }
 ret:
+        nfs3_call_state_wipe (cs);
         return;
 }
 
@@ -589,10 +672,9 @@ nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 {
         nlm4_stats                      stat = nlm4_denied;
         nfs3_call_state_t              *cs = NULL;
-        call_frame_t *frame2 = NULL;
 
         cs = frame->local;
-        frame2 = copy_frame (frame);
+
         if (op_ret == -1) {
                 stat = nlm4_errno_to_nlm4stat (op_errno);
                 goto err;
@@ -601,7 +683,8 @@ nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
 err:
         if (cs->args.nlm4_lockargs.block) {
-                nlm4svc_send_granted (cs, frame2);
+                cs->frame = copy_frame (frame);
+                nlm4svc_send_granted (cs);
         } else {
                 nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
                                     stat);
@@ -1021,7 +1104,7 @@ rpcerr:
         }
         return ret;
 }
-
+/*
 int
 nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                 void *data2)
@@ -1073,7 +1156,7 @@ nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                 goto err;
         }
 
-//        dict_set_str (options, "non-blocking-io", "off");
+        dict_set_str (options, "non-blocking-io", "off");
 
         rpc_clnt = rpc_clnt_new (options, nfsx->ctx, trans->name);
         rpc_transport_connect (rpc_clnt->conn.trans, 5000);
@@ -1083,7 +1166,7 @@ nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
 err:
         return 0;
 }
-
+*/
 
 rpcsvc_actor_t  nlm4svc_actors[NLM4_PROC_COUNT] = {
         {"NULL", NLM4_NULL, nlm4svc_null, NULL, NULL},
@@ -1191,8 +1274,9 @@ nlm4svc_init(xlator_t *nfsx)
                 dict_unref (options);
                 goto err;
         }
+        ns->nlm_cbk_clnt = dict_new();
 
-        rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
+//        rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
 
         return &nlm4prog;
 err:
