@@ -21,6 +21,7 @@
 #include "nlm4-xdr.h"
 #include "msg-nfs3.h"
 #include "nfs-generics.h"
+#include "rpc-clnt.h"
 #include <unistd.h>
 
 typedef ssize_t (*nlm4_serializer) (struct iovec outmsg, void *args);
@@ -503,26 +504,95 @@ rpcerr:
         }
         return ret;
 }
-rpcsvc_program_t nlm4prog;
+
+rpc_clnt_procedure_t nlm4_clnt_actors[NLM4_PROC_COUNT] = {
+        [NLM4_NULL] = {"NULL", NULL},
+        [NLM4_GRANTED] = {"GRANTED", NULL},
+};
+
+char *nlm4_clnt_names[NLM4_PROC_COUNT] = {
+        [NLM4_NULL] = "NULL",
+        [NLM4_GRANTED] = "GRANTED",
+};
+
+rpc_clnt_prog_t nlm4clntprog = {
+        .progname = "NLMv4",
+        .prognum = NLM_PROGRAM,
+        .progver = NLM_V4,
+        .numproc = NLM4_PROC_COUNT,
+        .proctable = nlm4_clnt_actors,
+        .procnames = nlm4_clnt_names,
+};
+
+int
+nlm4svc_send_granted_cbk (struct rpc_req *req, struct iovec *iov, int count,
+                          void *myframe)
+{
+        return 0;
+}
+
+void
+nlm4svc_send_granted (nfs3_call_state_t *cs, call_frame_t *frame)
+{
+        int ret = -1;
+        rpc_clnt_t *rpc_clnt;
+        struct iovec            outmsg = {0, };
+        nlm4_testargs testargs;
+        struct iobuf *iobuf;
+        struct iobref *iobref;
+        struct nfs_state *nfs;
+
+        nfs = cs->nfsx->private;
+        rpc_clnt = nfs->rpc_clnt;
+        testargs.cookie = cs->args.nlm4_lockargs.cookie;
+        testargs.exclusive = cs->args.nlm4_lockargs.exclusive;
+        testargs.alock = cs->args.nlm4_lockargs.alock;
+
+        iobuf = iobuf_get (cs->nfs3state->iobpool);
+        if (!iobuf) {
+                gf_log (GF_NLM, GF_LOG_ERROR, "Failed to get iobuf");
+                goto ret;
+        }
+
+        iobuf_to_iovec (iobuf, &outmsg);
+        /* Use the given serializer to translate the give C structure in arg
+         * to XDR format which will be written into the buffer in outmsg.
+         */
+        outmsg.iov_len = xdr_serialize_nlm4_testargs (outmsg, &testargs);
+
+        iobref = iobref_new ();
+        if (iobref == NULL) {
+                gf_log (GF_NLM, GF_LOG_ERROR, "Failed to get iobref");
+                goto ret;
+        }
+
+        iobref_add (iobref, iobuf);
+
+        ret = rpc_clnt_submit (rpc_clnt, &nlm4clntprog, NLM4_GRANTED,
+                               nlm4svc_send_granted_cbk,
+                               &outmsg, 1,
+                               NULL,
+                               0, iobref, frame, NULL, 0,
+                               NULL, 0, NULL);
+
+        if (ret < 0) {
+                gf_log (GF_NLM, GF_LOG_ERROR, "rpc_clnt_submit error");
+                goto ret;
+        }
+ret:
+        return;
+}
+
 int
 nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                   int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
 {
         nlm4_stats                      stat = nlm4_denied;
         nfs3_call_state_t              *cs = NULL;
-        nlm4_testargs testargs = {{0},};
-        rpcsvc_t *rpc = NULL;
-        struct nfs3_state *nfs3 = NULL;
-        rpc_transport_t *trans = NULL;
+        call_frame_t *frame2 = NULL;
 
         cs = frame->local;
-
-        nfs3 = cs->nfs3state;
-        rpc = cs->req->svc;
-        trans = cs->req->trans;
-        testargs.alock = cs->args.nlm4_lockargs.alock;
-        testargs.exclusive = 1;
-        testargs.cookie = cs->args.nlm4_lockargs.cookie;
+        frame2 = copy_frame (frame);
         if (op_ret == -1) {
                 stat = nlm4_errno_to_nlm4stat (op_errno);
                 goto err;
@@ -530,12 +600,13 @@ nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 stat = nlm4_granted;
 
 err:
-        nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie, stat);
-/*
-        nlm4svc_submit_request (rpc, trans, &nlm4prog, NLM4_GRANTED, nfs3,
-                                &testargs, (nlm4_serializer)xdr_serialize_nlm4_testargs);
-*/
-        nfs3_call_state_wipe (cs);
+        if (cs->args.nlm4_lockargs.block) {
+                nlm4svc_send_granted (cs, frame2);
+        } else {
+                nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
+                                    stat);
+                nfs3_call_state_wipe (cs);
+        }
         return 0;
 }
 
@@ -557,10 +628,12 @@ nlm4_lock_fd_resume (void *carg)
         nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_lockargs.alock,
                                cs->args.nlm4_lockargs.exclusive);
         nfu.lk_owner = flock.l_owner;
-        if (cs->args.nlm4_lockargs.block)
+        if (cs->args.nlm4_lockargs.block) {
+                nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
+                                    nlm4_blocked);
                 ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_SETLKW,
                               &flock, nlm4svc_lock_cbk, cs);
-        else
+        } else
                 ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_SETLK,
                               &flock, nlm4svc_lock_cbk, cs);
 
@@ -631,17 +704,18 @@ nlm4svc_lock (rpcsvc_request_t *req)
         nlm4_handle_call_state_init (nfs->nfs3state, cs, req,
                                      stat, rpcerr);
 
-        nlm4_prep_nlm4_lockargs (&cs->args.nlm4_lockargs, &fh, &cs->lkowner,
-                                 cs->cookiebytes);
+        nlm4_prep_nlm4_lockargs (&cs->args.nlm4_lockargs, &cs->lockfh,
+                                 &cs->lkowner, cs->cookiebytes);
         if (xdr_to_nlm4_lockargs(req->msg[0], &cs->args.nlm4_lockargs) <= 0) {
                 gf_log (GF_NFS3, GF_LOG_ERROR, "Error decoding args");
                 rpcsvc_request_seterr (req, GARBAGE_ARGS);
                 goto rpcerr;
         }
-
+        fh = cs->lockfh;
         nlm4_validate_gluster_fh (&fh, stat, nlm4err);
         nlm4_map_fh_to_volume (cs->nfs3state, &fh, req, vol, stat, nlm4err);
         cs->vol = vol;
+        cs->trans = rpcsvc_request_transport_ref(req);
         nlm4_volume_started_check (nfs3, vol, ret, rpcerr);
 
         ret = nfs3_fh_resolve_and_resume (cs, &fh,
@@ -948,6 +1022,68 @@ rpcerr:
         return ret;
 }
 
+int
+nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
+                void *data2)
+{
+        dict_t *options = NULL;
+        struct sockaddr_storage sa;
+        struct sockaddr_in *sin;
+        char *peer, *portstr;
+        int ret = -1;
+        rpc_clnt_t *rpc_clnt;
+        rpc_transport_t *trans = NULL;
+        xlator_t *nfsx;
+        struct nfs_state *nfs = NULL;
+
+        nfsx = data1;
+        trans = data2;
+
+        if (strcmp("socket.NLM", trans->name)|| event != RPCSVC_EVENT_ACCEPT)
+                return 0;
+        else
+                gf_log (GF_NFS, GF_LOG_ERROR, "nlm conn");
+
+        ret = rpc_transport_get_peeraddr (trans, NULL, 0, &sa, sizeof (sa));
+        sin = (struct sockaddr_in *) &sa;
+        peer = inet_ntoa (sin->sin_addr);
+
+        options = dict_new();
+
+        ret = dict_set_str (options, "transport-type", "socket");
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto err;
+        }
+
+        ret = dict_set_dynstr (options, "remote-host", strdup (peer));
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto err;
+        }
+
+        ret = gf_asprintf (&portstr, "%d", 5000);
+        if (ret == -1)
+                goto err;
+
+        ret = dict_set_dynstr (options, "remote-port",
+                               portstr);
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto err;
+        }
+
+//        dict_set_str (options, "non-blocking-io", "off");
+
+        rpc_clnt = rpc_clnt_new (options, nfsx->ctx, trans->name);
+        rpc_transport_connect (rpc_clnt->conn.trans, 5000);
+
+        nfs = nfsx->private;
+        nfs->rpc_clnt = rpc_clnt;
+err:
+        return 0;
+}
+
 
 rpcsvc_actor_t  nlm4svc_actors[NLM4_PROC_COUNT] = {
         {"NULL", NLM4_NULL, nlm4svc_null, NULL, NULL},
@@ -1049,12 +1185,14 @@ nlm4svc_init(xlator_t *nfsx)
                 }
         }
 
-        rpcsvc_create_listeners (nfs->rpcsvc, options, nfsx->name);
+        rpcsvc_create_listeners (nfs->rpcsvc, options, "NLM");
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "Unable to create listeners");
                 dict_unref (options);
                 goto err;
         }
+
+        rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
 
         return &nlm4prog;
 err:

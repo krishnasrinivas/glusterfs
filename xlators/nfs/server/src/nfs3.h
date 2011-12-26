@@ -230,6 +230,8 @@ struct nfs3_local {
         args                    args;
         nlm4_lkowner_t          lkowner;
         char                    cookiebytes[1024];
+        struct nfs3_fh          lockfh;
+        rpc_transport_t         *trans;
 };
 
 #define nfs3_is_revalidate_lookup(cst) ((cst)->lookuptype == GF_NFS3_REVALIDATE)

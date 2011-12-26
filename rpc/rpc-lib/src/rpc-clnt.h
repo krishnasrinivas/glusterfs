@@ -172,7 +172,7 @@ struct rpc_req {
         void                  *conn_private;
 };
 
-struct rpc_clnt {
+typedef struct rpc_clnt {
         pthread_mutex_t        lock;
         rpc_clnt_notify_t      notifyfn;
         rpc_clnt_connection_t  conn;
@@ -189,7 +189,7 @@ struct rpc_clnt {
 
         glusterfs_ctx_t       *ctx;
         int                   refcount;
-};
+} rpc_clnt_t;
 
 
 struct rpc_clnt *rpc_clnt_new (dict_t *options, glusterfs_ctx_t *ctx,

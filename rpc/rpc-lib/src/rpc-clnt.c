@@ -995,7 +995,7 @@ rpc_clnt_connection_init (struct rpc_clnt *clnt, glusterfs_ctx_t *ctx,
                 conn = NULL;
                 goto out;
         }
-
+        
         conn->saved_frames = saved_frames_new ();
         if (!conn->saved_frames) {
                 gf_log (name, GF_LOG_WARNING, "creation of saved_frames "
@@ -1140,6 +1140,7 @@ rpc_clnt_fill_request (int prognum, int progver, int procnum, int payload,
         /* TODO: Using AUTH_GLUSTERFS for time-being. Make it modular in
          * future so it is easy to plug-in new authentication schemes.
          */
+        if (auth_data) {
         ret = xdr_serialize_glusterfs_auth (auth_data, au);
         if (ret == -1) {
                 gf_log ("rpc-clnt", GF_LOG_DEBUG, "cannot encode credentials");
@@ -1149,7 +1150,11 @@ rpc_clnt_fill_request (int prognum, int progver, int procnum, int payload,
         request->rm_call.cb_cred.oa_flavor = AUTH_GLUSTERFS;
         request->rm_call.cb_cred.oa_base   = auth_data;
         request->rm_call.cb_cred.oa_length = ret;
-
+        } else {
+        request->rm_call.cb_cred.oa_flavor = AUTH_NULL;
+        request->rm_call.cb_cred.oa_base   = NULL;
+        request->rm_call.cb_cred.oa_length = 0;
+        }
         request->rm_call.cb_verf.oa_flavor = AUTH_NONE;
         request->rm_call.cb_verf.oa_base = NULL;
         request->rm_call.cb_verf.oa_length = 0;
@@ -1226,6 +1231,10 @@ rpc_clnt_record_build_record (struct rpc_clnt *clnt, int prognum, int progver,
         record = iobuf_ptr (request_iob);  /* Now we have it. */
 
         /* Fill the rpc structure and XDR it into the buffer got above. */
+        if (!strcmp("socket.NLM", clnt->conn.trans->name))
+        ret = rpc_clnt_fill_request (prognum, progver, procnum, payload, xid,
+                                     au, &request, NULL);
+        else
         ret = rpc_clnt_fill_request (prognum, progver, procnum, payload, xid,
                                      au, &request, auth_data);
         if (ret == -1) {

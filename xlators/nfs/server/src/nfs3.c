@@ -450,6 +450,8 @@ nfs3_call_state_wipe (nfs3_call_state_t *cs)
                 iobuf_unref (cs->iob);
         if (cs->iobref)
                 iobref_unref (cs->iobref);
+        if (cs->trans)
+                rpc_transport_unref (cs->trans);
         memset (cs, 0, sizeof (*cs));
         mem_put (cs);
         /* Already refd by fd_lookup, so no need to ref again. */
