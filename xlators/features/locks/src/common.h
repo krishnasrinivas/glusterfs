@@ -131,4 +131,8 @@ pl_verify_reservelk (xlator_t *this, pl_inode_t *pl_inode,
                      posix_lock_t *lock, int can_block);
 int
 pl_reserve_unlock (xlator_t *this, pl_inode_t *pl_inode, posix_lock_t *reqlock);
+
+int
+pl_locks_by_lkowner (pl_inode_t *pl_inode, uint64_t lk_owner);
+
 #endif /* __COMMON_H__ */

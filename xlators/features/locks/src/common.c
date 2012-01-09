@@ -570,8 +570,8 @@ same_owner (posix_lock_t *l1, posix_lock_t *l2)
 {
 
                 return ((l1->owner == l2->owner) &&
-                        (l1->transport  == l2->transport)
-                        (l1->pid == l2->pid));
+                        (l1->transport  == l2->transport) &&
+                        (l1->client_pid == l2->client_pid));
 
 }
 
@@ -591,6 +591,22 @@ __delete_unlck_locks (pl_inode_t *pl_inode)
         }
 }
 
+int
+pl_locks_by_lkowner (pl_inode_t *pl_inode, uint64_t lk_owner)
+{
+        posix_lock_t *l = NULL;
+        int found = 0;
+
+        pthread_mutex_lock (&pl_inode->mutex);
+        list_for_each_entry (l, &pl_inode->ext_list, list) {
+                if (l->owner == lk_owner) {
+                        found = 1;
+                        break;
+                }
+        }
+        pthread_mutex_lock (&pl_inode->mutex);
+        return found;
+}
 
 /* Add two locks */
 static posix_lock_t *
