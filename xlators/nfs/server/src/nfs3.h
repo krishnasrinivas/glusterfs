@@ -136,6 +136,7 @@ typedef struct nfs3_state {
         int                     fdcount;
         dict_t                  *nlm_cbk_clnt;
         struct rpc_clnt *rpc_clnt;
+        struct list_head        nlm_client_list;
 } nfs3_state_t;
 
 typedef enum nfs3_lookup_type {

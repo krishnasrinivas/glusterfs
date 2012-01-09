@@ -59,4 +59,12 @@ typedef struct nlm4_state {
         struct iobuf_pool *iobpool;
 } nlm4_state_t;
 */
+
+typedef struct nlm_client {
+        struct sockaddr_storage sa;
+        pid_t uniq;
+        struct list_head nlm_clients;
+        struct list_head fds;
+} nlm_client_t;
+
 #endif

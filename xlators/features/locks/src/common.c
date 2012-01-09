@@ -570,7 +570,8 @@ same_owner (posix_lock_t *l1, posix_lock_t *l2)
 {
 
                 return ((l1->owner == l2->owner) &&
-                        (l1->transport  == l2->transport));
+                        (l1->transport  == l2->transport)
+                        (l1->pid == l2->pid));
 
 }
 

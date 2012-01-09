@@ -585,10 +585,15 @@ nlm4_establish_callback (void *csarg)
         }
 
         rpc_clnt = rpc_clnt_new (options, cs->nfsx->ctx, "NLM-client");
+        if (rpc_clnt == NULL) {
+                gf_log (GF_NLM, GF_LOG_ERROR, "rpc_clnt NULL");
+                goto err;
+        }
         rpc_transport_connect (rpc_clnt->conn.trans, port);
         rpc_clnt_set_connected (&rpc_clnt->conn);
         cs->nfs3state->rpc_clnt = rpc_clnt;
-        ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip, &rpc_clnt);
+        ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip,
+                                   rpc_clnt);
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_ptr error");
                 goto err;
@@ -1168,6 +1173,99 @@ err:
 }
 */
 
+int ipv6_addr_equal(const struct in6_addr *a1,
+                    const struct in6_addr *a2)
+{
+	return (((a1->s6_addr32[0] ^ a2->s6_addr32[0]) |
+		 (a1->s6_addr32[1] ^ a2->s6_addr32[1]) |
+		 (a1->s6_addr32[2] ^ a2->s6_addr32[2]) |
+		 (a1->s6_addr32[3] ^ a2->s6_addr32[3])) == 0);
+}
+
+int __rpc_cmp_addr4(const struct sockaddr *sap1,
+                                const struct sockaddr *sap2)
+{
+	const struct sockaddr_in *sin1 = (const struct sockaddr_in *)sap1;
+	const struct sockaddr_in *sin2 = (const struct sockaddr_in *)sap2;
+
+	return sin1->sin_addr.s_addr == sin2->sin_addr.s_addr;
+}
+
+int __rpc_cmp_addr6(const struct sockaddr *sap1,
+                    const struct sockaddr *sap2)
+{
+	const struct sockaddr_in6 *sin1 = (const struct sockaddr_in6 *)sap1;
+	const struct sockaddr_in6 *sin2 = (const struct sockaddr_in6 *)sap2;
+	return ipv6_addr_equal(&sin1->sin6_addr, &sin2->sin6_addr);
+}
+
+int rpc_cmp_addr(const struct sockaddr *sap1,
+				const struct sockaddr *sap2)
+{
+	if (sap1->sa_family == sap2->sa_family) {
+		switch (sap1->sa_family) {
+		case AF_INET:
+			return __rpc_cmp_addr4(sap1, sap2);
+		case AF_INET6:
+			return __rpc_cmp_addr6(sap1, sap2);
+		}
+	}
+	return 0;
+}
+
+
+int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
+                    void *data2)
+{
+        struct sockaddr_storage sa;
+        struct sockaddr_in *sin;
+        char *peer;
+        int ret = -1;
+        rpc_transport_t *trans = NULL;
+        xlator_t *nfsx;
+        struct nfs_state *nfs = NULL;
+        nlm_client_t *nlmclnt = NULL;
+
+        nfsx = data1;
+        trans = data2;
+
+        if (event != RPCSVC_EVENT_ACCEPT)
+                return 0;
+
+        if (strcmp("socket.NLM", trans->name))
+                return 0;
+
+        ret = rpc_transport_get_peeraddr (trans, NULL, 0, &sa, sizeof (sa));
+        sin = (struct sockaddr_in *) &sa;
+        peer = inet_ntoa (sin->sin_addr);
+
+        nfs = nfs_state (nfsx);
+
+        list_for_each_entry (nlmclnt, &nfs->nfs3state->nlm_client_list,
+                             nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*) &nlmclnt->sa,
+                                 (struct sockaddr*)&sa)) {
+                        gf_log (GF_NLM, GF_LOG_ERROR, "old clnt");
+                        return 0;
+                }
+        }
+
+        gf_log (GF_NLM, GF_LOG_ERROR, "new clnt");
+        nlmclnt = GF_CALLOC (1, sizeof(*nlmclnt), gf_nfs_mt_nlm4_state);
+        if (nlmclnt == NULL) {
+                gf_log (GF_NLM, GF_LOG_DEBUG, "malloc error");
+                return 0;
+        }
+
+        INIT_LIST_HEAD(&nlmclnt->fds);
+        INIT_LIST_HEAD(&nlmclnt->nlm_clients);
+        nlmclnt->sa = sa;
+        list_add (&nlmclnt->nlm_clients, &nfs->nfs3state->nlm_client_list);
+
+        return 0;
+}
+
+
 rpcsvc_actor_t  nlm4svc_actors[NLM4_PROC_COUNT] = {
         {"NULL", NLM4_NULL, nlm4svc_null, NULL, NULL},
         {"TEST", NLM4_TEST, nlm4svc_test, NULL, NULL},
@@ -1275,8 +1373,8 @@ nlm4svc_init(xlator_t *nfsx)
                 goto err;
         }
         ns->nlm_cbk_clnt = dict_new();
-
-//        rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
+        INIT_LIST_HEAD(&ns->nlm_client_list);
+        rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
 
         return &nlm4prog;
 err:
