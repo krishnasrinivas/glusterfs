@@ -237,6 +237,7 @@ struct nfs3_local {
         rpc_transport_t         *trans;
         /* not being freed */
         call_frame_t            *frame;
+        pid_t                    uniq;
 };
 
 #define nfs3_is_revalidate_lookup(cst) ((cst)->lookuptype == GF_NFS3_REVALIDATE)

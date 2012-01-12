@@ -64,7 +64,12 @@ typedef struct nlm_client {
         struct sockaddr_storage sa;
         pid_t uniq;
         struct list_head nlm_clients;
-        struct list_head fds;
+        struct list_head fdes;
 } nlm_client_t;
+
+typedef struct nlm_fde {
+        struct list_head fde_list;
+        fd_t *fd;
+} nlm_fde_t;
 
 #endif

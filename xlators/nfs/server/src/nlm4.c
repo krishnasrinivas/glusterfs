@@ -118,6 +118,10 @@ nfs3_fh_to_xlator (struct nfs3_state *nfs3, struct nfs3_fh *fh);
                 }                                                       \
         } while (0)                                                     \
 
+int rpc_cmp_addr(const struct sockaddr *sap1,
+                 const struct sockaddr *sap2);
+
+
 nfs3_call_state_t *
 nlm4_call_state_init (struct nfs3_state *s, rpcsvc_request_t *req)
 {
@@ -254,6 +258,88 @@ nlm4svc_submit_request (rpcsvc_t *rpc, rpc_transport_t *trans,
 ret:
         return ret;
 }
+
+typedef int (*nlm4_resume_fn_t) (void *cs);
+
+int32_t
+nlm4_file_open_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                   int32_t op_ret, int32_t op_errno, fd_t *fd)
+{
+        nfs3_call_state_t *cs = frame->local;
+        cs->resolve_ret = op_ret;
+        cs->resume_fn (cs);
+        frame->local = NULL;
+        STACK_DESTROY (frame->root);
+        return 0;
+}
+
+nlm_client_t *
+nlm_search (nfs3_call_state_t *cs)
+{
+        struct sockaddr_storage sa;
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+
+        list_for_each_entry (nlmclnt,
+                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr*)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+        if (nlmclnt_found)
+                return nlmclnt;
+        else
+                return NULL;
+}
+
+int
+nlm4_file_open_and_resume(nfs3_call_state_t *cs, nlm4_resume_fn_t resume)
+{
+        fd_t *fd;
+        int ret;
+        call_frame_t *frame;
+        nlm_client_t *nlmclnt = NULL;
+
+        nlmclnt = nlm_search(cs);
+        cs->uniq = nlmclnt->uniq;
+        cs->resume_fn = resume;
+        fd = fd_lookup (cs->resolvedloc.inode, cs->uniq);
+        if (fd) {
+                cs->fd = fd;
+                cs->resolve_ret = 0;
+                cs->resume_fn(cs);
+                ret = 0;
+                goto err;
+        }
+
+        fd = fd_create (cs->resolvedloc.inode, cs->uniq);
+        if (fd == NULL) {
+                cs->resolve_ret = -1;
+                cs->resume_fn(cs);
+                ret = -1;
+                goto err;
+        }
+
+        cs->fd = fd;
+
+        frame = create_frame (cs->nfsx, cs->nfsx->ctx->pool);
+        frame->root->pid = NFS_PID;
+        frame->root->uid = 0;
+        frame->root->gid = 0;
+        frame->local = cs;
+        STACK_WIND_COOKIE(frame, nlm4_file_open_cbk, cs->nfsx, cs->nfsx,
+                          cs->nfsx->fops->open, &cs->resolvedloc, O_RDWR,
+                          cs->fd, GF_OPEN_NOWB);
+
+err:
+        return 0;
+}
+
+
 
 int
 nlm4_generic_reply (rpcsvc_request_t *req, netobj cookie, nlm4_stats stat)
@@ -698,6 +784,50 @@ err:
         return 0;
 }
 
+
+nlm_client_t *
+nlm_search_and_add (nfs3_call_state_t *cs)
+{
+        nlm_fde_t *fde = NULL;
+        struct sockaddr_storage sa;
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+        int fde_found = 0;
+
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+
+        list_for_each_entry (nlmclnt,
+                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr*)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+
+        if (!nlmclnt_found)
+                return NULL;
+
+        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
+        list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
+                if (fde->fd == cs->fd) {
+                        fde_found = 1;
+                        break;
+                }
+        }
+
+        if (fde_found)
+                return nlmclnt;
+
+        gf_log (GF_NLM, GF_LOG_ERROR, "adding fd to list");
+        fde = GF_CALLOC (1, sizeof (*fde), gf_nfs_mt_nlm4_state);
+
+        fde->fd = fd_ref (cs->fd);
+        list_add (&fde->fde_list, &nlmclnt->fdes);
+
+        return nlmclnt;
+}
+
 int
 nlm4_lock_fd_resume (void *carg)
 {
@@ -706,16 +836,20 @@ nlm4_lock_fd_resume (void *carg)
         nfs_user_t                      nfu = {0, };
         nfs3_call_state_t               *cs = NULL;
         struct gf_flock                 flock = {0, };
+        nlm_client_t                    *nlmclnt = NULL;
 
         if (!carg)
                 return ret;
 
         cs = (nfs3_call_state_t *)carg;
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
+
+        nlmclnt = nlm_search_and_add (cs);
+        fd_bind(cs->fd);
         nfs_request_user_init (&nfu, cs->req);
         nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_lockargs.alock,
                                cs->args.nlm4_lockargs.exclusive);
-        nfu.lk_owner = flock.l_owner;
+        nfu.lk_owner = flock.l_owner = (uint64_t) nlmclnt;
         if (cs->args.nlm4_lockargs.block) {
                 nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
                                     nlm4_blocked);
@@ -753,7 +887,7 @@ nlm4_lock_resume (void *carg)
 
         cs = (nfs3_call_state_t *)carg;
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
-        ret = nfs3_file_open_and_resume (cs, nlm4_lock_fd_resume);
+        ret = nlm4_file_open_and_resume (cs, nlm4_lock_fd_resume);
         if (ret < 0)
                 stat = nlm4_errno_to_nlm4stat (-ret);
 
@@ -969,6 +1103,49 @@ rpcerr:
         return ret;
 }
 
+void
+nlm_search_and_delete (nfs3_call_state_t *cs)
+{
+        nlm_fde_t *fde = NULL;
+        struct sockaddr_storage sa;
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+        int fde_found = 0;
+
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+
+        list_for_each_entry (nlmclnt,
+                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr*)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+
+        if (!nlmclnt_found)
+                return;
+
+        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
+
+        list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
+                if (fde->fd == cs->fd) {
+                        fde_found = 1;
+                        break;
+                }
+        }
+
+        if (!fde_found)
+                return;
+        gf_log (GF_NLM, GF_LOG_ERROR, "deleting fd from list");
+        list_del (&fde->fde_list);
+        fd_unref (fde->fd);
+        GF_FREE (fde);
+
+        return;
+}
+
+
 int
 nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                     int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
@@ -980,8 +1157,11 @@ nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (op_ret == -1) {
                 stat = nlm4_errno_to_nlm4stat (op_errno);
                 goto err;
-        } else
+        } else {
                 stat = nlm4_granted;
+//                if (flock->l_type == F_UNLCK)
+                        nlm_search_and_delete (cs);
+        }
 
 err:
         nlm4_generic_reply (cs->req, cs->args.nlm4_unlockargs.cookie, stat);
@@ -1006,7 +1186,7 @@ nlm4_unlock_fd_resume (void *carg)
         nfs_request_user_init (&nfu, cs->req);
         nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_unlockargs.alock, 0);
         flock.l_type = F_UNLCK;
-        nfu.lk_owner = flock.l_owner;
+        nfu.lk_owner = flock.l_owner = (uint64_t)nlm_search (cs);
         ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_SETLK,
                       &flock, nlm4svc_unlock_cbk, cs);
 
@@ -1031,15 +1211,21 @@ nlm4_unlock_resume (void *carg)
         nlm4_stats                      stat = nlm4_failed;
         int                             ret = -1;
         nfs3_call_state_t               *cs = NULL;
+        nlm_client_t                    *nlmclnt = NULL;
 
         if (!carg)
                 return ret;
 
         cs = (nfs3_call_state_t *)carg;
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
-        ret = nfs3_file_open_and_resume (cs, nlm4_unlock_fd_resume);
-        if (ret < 0)
-                stat = nlm4_errno_to_nlm4stat (-ret);
+
+        nlmclnt = nlm_search(cs);
+        cs->uniq = nlmclnt->uniq;
+
+        cs->fd = fd_lookup (cs->resolvedloc.inode, cs->uniq);
+        if (cs->fd == NULL)
+                goto nlm4err;
+        ret = nlm4_unlock_fd_resume (cs);
 
 nlm4err:
         if (ret < 0) {
@@ -1088,6 +1274,7 @@ nlm4svc_unlock (rpcsvc_request_t *req)
         nlm4_validate_gluster_fh (&fh, stat, nlm4err);
         nlm4_map_fh_to_volume (cs->nfs3state, &fh, req, vol, stat, nlm4err);
         cs->vol = vol;
+        cs->trans = rpcsvc_request_transport_ref(req);
         nlm4_volume_started_check (nfs3, vol, ret, rpcerr);
 
         ret = nfs3_fh_resolve_and_resume (cs, &fh,
@@ -1200,7 +1387,7 @@ int __rpc_cmp_addr6(const struct sockaddr *sap1,
 }
 
 int rpc_cmp_addr(const struct sockaddr *sap1,
-				const struct sockaddr *sap2)
+                 const struct sockaddr *sap2)
 {
 	if (sap1->sa_family == sap2->sa_family) {
 		switch (sap1->sa_family) {
@@ -1213,6 +1400,7 @@ int rpc_cmp_addr(const struct sockaddr *sap1,
 	return 0;
 }
 
+int uniq = 1;
 
 int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                     void *data2)
@@ -1245,21 +1433,20 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                              nlm_clients) {
                 if (rpc_cmp_addr((struct sockaddr*) &nlmclnt->sa,
                                  (struct sockaddr*)&sa)) {
-                        gf_log (GF_NLM, GF_LOG_ERROR, "old clnt");
                         return 0;
                 }
         }
 
-        gf_log (GF_NLM, GF_LOG_ERROR, "new clnt");
         nlmclnt = GF_CALLOC (1, sizeof(*nlmclnt), gf_nfs_mt_nlm4_state);
         if (nlmclnt == NULL) {
                 gf_log (GF_NLM, GF_LOG_DEBUG, "malloc error");
                 return 0;
         }
 
-        INIT_LIST_HEAD(&nlmclnt->fds);
+        INIT_LIST_HEAD(&nlmclnt->fdes);
         INIT_LIST_HEAD(&nlmclnt->nlm_clients);
         nlmclnt->sa = sa;
+        nlmclnt->uniq = uniq++;
         list_add (&nlmclnt->nlm_clients, &nfs->nfs3state->nlm_client_list);
 
         return 0;
