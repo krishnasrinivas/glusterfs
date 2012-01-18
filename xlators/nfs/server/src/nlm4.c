@@ -305,6 +305,7 @@ nlm4_file_open_and_resume(nfs3_call_state_t *cs, nlm4_resume_fn_t resume)
         nlm_client_t *nlmclnt = NULL;
 
         nlmclnt = nlm_search(cs);
+        /* FIXME: if(nlmclnt == NULL) */
         cs->uniq = nlmclnt->uniq;
         cs->resume_fn = resume;
         fd = fd_lookup (cs->resolvedloc.inode, cs->uniq);
@@ -452,7 +453,7 @@ nlm4_test_fd_resume (void *carg)
         nfs_request_user_init (&nfu, cs->req);
         nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_testargs.alock,
                                cs->args.nlm4_testargs.exclusive);
-        nfu.lk_owner = flock.l_owner;
+        nfu.lk_owner = flock.l_owner = (uint64_t)nlm_search (cs);
         ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_GETLK, &flock,
                       nlm4svc_test_cbk, cs);
         if (ret < 0)
@@ -757,6 +758,49 @@ ret:
         return;
 }
 
+
+void
+nlm_search_and_delete (nfs3_call_state_t *cs)
+{
+        nlm_fde_t *fde = NULL;
+        struct sockaddr_storage sa;
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+        int fde_found = 0;
+
+        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
+
+        list_for_each_entry (nlmclnt,
+                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr*)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+
+        if (!nlmclnt_found)
+                return;
+
+        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
+
+        list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
+                if (fde->fd == cs->fd) {
+                        fde_found = 1;
+                        break;
+                }
+        }
+
+        if (!fde_found)
+                return;
+        gf_log (GF_NLM, GF_LOG_ERROR, "deleting fd from list");
+        list_del (&fde->fde_list);
+        fd_unref (fde->fd);
+        GF_FREE (fde);
+
+        return;
+}
+
 int
 nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                   int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
@@ -767,6 +811,7 @@ nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         cs = frame->local;
 
         if (op_ret == -1) {
+                nlm_search_and_delete (cs);
                 stat = nlm4_errno_to_nlm4stat (op_errno);
                 goto err;
         } else
@@ -1031,9 +1076,15 @@ nlm4_cancel_resume (void *carg)
 
         cs = (nfs3_call_state_t *)carg;
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
-        ret = nfs3_file_open_and_resume (cs, nlm4_cancel_fd_resume);
-        if (ret < 0)
-                stat = nlm4_errno_to_nlm4stat (-ret);
+
+        nlmclnt = nlm_search(cs);
+        /* FIXME: if (nlmclnt == NULL) */
+        cs->uniq = nlmclnt->uniq;
+
+        cs->fd = fd_lookup (cs->resolvedloc.inode, cs->uniq);
+        if (cs->fd == NULL)
+                goto nlm4err;
+        ret = nlm4_unlock_fd_resume (cs);
 
 nlm4err:
         if (ret < 0) {
@@ -1103,48 +1154,6 @@ rpcerr:
         return ret;
 }
 
-void
-nlm_search_and_delete (nfs3_call_state_t *cs)
-{
-        nlm_fde_t *fde = NULL;
-        struct sockaddr_storage sa;
-        nlm_client_t *nlmclnt = NULL;
-        int nlmclnt_found = 0;
-        int fde_found = 0;
-
-        rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
-
-        list_for_each_entry (nlmclnt,
-                             &cs->nfs3state->nlm_client_list, nlm_clients) {
-                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
-                                 (struct sockaddr*)&sa)) {
-                        nlmclnt_found = 1;
-                        break;
-                }
-        }
-
-        if (!nlmclnt_found)
-                return;
-
-        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
-
-        list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
-                if (fde->fd == cs->fd) {
-                        fde_found = 1;
-                        break;
-                }
-        }
-
-        if (!fde_found)
-                return;
-        gf_log (GF_NLM, GF_LOG_ERROR, "deleting fd from list");
-        list_del (&fde->fde_list);
-        fd_unref (fde->fd);
-        GF_FREE (fde);
-
-        return;
-}
-
 
 int
 nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
@@ -1153,13 +1162,14 @@ nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         nlm4_stats                      stat = nlm4_denied;
         nfs3_call_state_t              *cs = NULL;
 
+        gf_log (GF_NLM, GF_LOG_INFO, "enter");
         cs = frame->local;
         if (op_ret == -1) {
                 stat = nlm4_errno_to_nlm4stat (op_errno);
                 goto err;
         } else {
                 stat = nlm4_granted;
-//                if (flock->l_type == F_UNLCK)
+                if (flock->l_type == F_UNLCK)
                         nlm_search_and_delete (cs);
         }
 
@@ -1180,7 +1190,7 @@ nlm4_unlock_fd_resume (void *carg)
 
         if (!carg)
                 return ret;
-
+        gf_log (GF_NLM, GF_LOG_INFO, "enter");
         cs = (nfs3_call_state_t *)carg;
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
         nfs_request_user_init (&nfu, cs->req);
@@ -1220,6 +1230,7 @@ nlm4_unlock_resume (void *carg)
         nlm4_check_fh_resolve_status (cs, stat, nlm4err);
 
         nlmclnt = nlm_search(cs);
+        /* FIXME: if (nlmclnt == NULL) */
         cs->uniq = nlmclnt->uniq;
 
         cs->fd = fd_lookup (cs->resolvedloc.inode, cs->uniq);
