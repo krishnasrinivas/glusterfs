@@ -741,7 +741,6 @@ nlm4_establish_callback (void *csarg)
                 goto err;
         }
         rpc_clnt_set_connected (&rpc_clnt->conn);
-        sleep(1);
         ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip,
                                    rpc_clnt);
         if (ret == -1) {
