@@ -22,8 +22,11 @@
 #include "msg-nfs3.h"
 #include "nfs-generics.h"
 #include "rpc-clnt.h"
+#include "nsm-xdr.h"
+#include "nlmcbk-xdr.h"
 #include <unistd.h>
 #include <rpc/pmap_clnt.h>
+#include <rpc/rpc.h>
 
 typedef ssize_t (*nlm4_serializer) (struct iovec outmsg, void *args);
 extern void
@@ -272,6 +275,58 @@ nlm4_file_open_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         STACK_DESTROY (frame->root);
         return 0;
 }
+
+int nsm_monitor(char *host)
+{
+
+  CLIENT *clnt;
+  enum clnt_stat ret;
+  struct mon nsm_mon;
+  struct sm_stat_res res;
+  struct timeval tout = { 5, 0 };
+  int retstat = -1;
+
+  gf_log (GF_NLM, GF_LOG_INFO, "mon: %s", host);
+
+  nsm_mon.mon_id.mon_name = strdup(host);
+  nsm_mon.mon_id.my_id.my_name = strdup("localhost");
+  nsm_mon.mon_id.my_id.my_prog = NLMCBK_PROGRAM;
+  nsm_mon.mon_id.my_id.my_vers = NLMCBK_V1;
+  nsm_mon.mon_id.my_id.my_proc = NLMCBK_SM_NOTIFY;
+  /* nothing to put in the private data */
+#define SM_PROG 100024
+#define SM_VERS 1
+#define SM_MON 2
+
+  /* create a connection to nsm on the localhost */
+  clnt = clnt_create("localhost", SM_PROG, SM_VERS, "tcp");
+  if(!clnt)
+    {
+            gf_log (GF_NFS, GF_LOG_ERROR, "Clnt_create()");
+            goto out;
+    }
+
+  ret = clnt_call(clnt, SM_MON,
+                  (xdrproc_t) xdr_mon, (caddr_t) & nsm_mon,
+                  (xdrproc_t) xdr_sm_stat_res, (caddr_t) & res, tout);
+  if(ret != RPC_SUCCESS)
+    {
+            gf_log (GF_NFS, GF_LOG_ERROR, "clnt_call(): %s", clnt_sperrno(ret));
+            goto out;
+    }
+  if(res.res_stat != STAT_SUCC)
+    {
+            gf_log (GF_NFS, GF_LOG_ERROR, "clnt_call(): %s", clnt_sperrno(ret));
+            goto out;
+    }
+  retstat = 0;
+out:
+  free(nsm_mon.mon_id.mon_name);
+  free(nsm_mon.mon_id.my_id.my_name);
+  clnt_destroy(clnt);
+  return retstat;
+}
+
 
 nlm_client_t *
 nlm_search (nfs3_call_state_t *cs)
@@ -636,6 +691,10 @@ nlm4_establish_callback (void *csarg)
         int ret;
 
         cs = (nfs3_call_state_t *) csarg;
+
+        gf_log (GF_NLM, GF_LOG_INFO, "establish callback");
+        nsm_monitor (cs->args.nlm4_lockargs.alock.caller_name);
+
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
         sin = (struct sockaddr_in*) &sa;
         peerip = inet_ntoa (sin->sin_addr);
@@ -676,9 +735,13 @@ nlm4_establish_callback (void *csarg)
                 gf_log (GF_NLM, GF_LOG_ERROR, "rpc_clnt NULL");
                 goto err;
         }
-        rpc_transport_connect (rpc_clnt->conn.trans, port);
+        ret = rpc_transport_connect (rpc_clnt->conn.trans, port);
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "rpc_transport_connect error");
+                goto err;
+        }
         rpc_clnt_set_connected (&rpc_clnt->conn);
-        cs->nfs3state->rpc_clnt = rpc_clnt;
+        sleep(1);
         ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip,
                                    rpc_clnt);
         if (ret == -1) {
@@ -706,7 +769,6 @@ nlm4svc_send_granted (nfs3_call_state_t *cs)
         struct sockaddr_in *sin;
 
         nfs = cs->nfsx->private;
-
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
         sin = (struct sockaddr_in *) &sa;
@@ -1065,11 +1127,72 @@ nlm4err:
 }
 
 int
+nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
+{
+        nlm4_stats                      stat = nlm4_denied;
+        nfs3_call_state_t              *cs = NULL;
+
+        gf_log (GF_NLM, GF_LOG_INFO, "enter");
+        cs = frame->local;
+        if (op_ret == -1) {
+                stat = nlm4_errno_to_nlm4stat (op_errno);
+                goto err;
+        } else {
+                stat = nlm4_granted;
+                if (flock->l_type == F_UNLCK)
+                        nlm_search_and_delete (cs);
+        }
+
+err:
+        nlm4_generic_reply (cs->req, cs->args.nlm4_unlockargs.cookie, stat);
+        nfs3_call_state_wipe (cs);
+        return 0;
+}
+
+int
+nlm4_unlock_fd_resume (void *carg)
+{
+        nlm4_stats                      stat = nlm4_denied;
+        int                             ret = -EFAULT;
+        nfs_user_t                      nfu = {0, };
+        nfs3_call_state_t               *cs = NULL;
+        struct gf_flock                 flock = {0, };
+
+        if (!carg)
+                return ret;
+        gf_log (GF_NLM, GF_LOG_INFO, "enter");
+        cs = (nfs3_call_state_t *)carg;
+        nlm4_check_fh_resolve_status (cs, stat, nlm4err);
+        nfs_request_user_init (&nfu, cs->req);
+        nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_unlockargs.alock, 0);
+        flock.l_type = F_UNLCK;
+        nfu.lk_owner = flock.l_owner = (uint64_t)nlm_search (cs);
+        ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_SETLK,
+                      &flock, nlm4svc_unlock_cbk, cs);
+
+        if (ret < 0)
+                stat = nlm4_errno_to_nlm4stat (-ret);
+nlm4err:
+        if (ret < 0) {
+//                nfs3_log_common_res (rpcsvc_request_xid (cs->req), "READ",
+//                                     stat, -ret);
+                gf_log (GF_NLM, GF_LOG_ERROR, "error here");
+                nlm4_generic_reply (cs->req, cs->args.nlm4_unlockargs.cookie,
+                                    stat);
+                nfs3_call_state_wipe (cs);
+        }
+
+        return ret;
+}
+
+int
 nlm4_cancel_resume (void *carg)
 {
         nlm4_stats                      stat = nlm4_failed;
         int                             ret = -1;
         nfs3_call_state_t               *cs = NULL;
+        nlm_client_t                    *nlmclnt = NULL;
 
         if (!carg)
                 return ret;
@@ -1155,65 +1278,6 @@ rpcerr:
 }
 
 
-int
-nlm4svc_unlock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                    int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
-{
-        nlm4_stats                      stat = nlm4_denied;
-        nfs3_call_state_t              *cs = NULL;
-
-        gf_log (GF_NLM, GF_LOG_INFO, "enter");
-        cs = frame->local;
-        if (op_ret == -1) {
-                stat = nlm4_errno_to_nlm4stat (op_errno);
-                goto err;
-        } else {
-                stat = nlm4_granted;
-                if (flock->l_type == F_UNLCK)
-                        nlm_search_and_delete (cs);
-        }
-
-err:
-        nlm4_generic_reply (cs->req, cs->args.nlm4_unlockargs.cookie, stat);
-        nfs3_call_state_wipe (cs);
-        return 0;
-}
-
-int
-nlm4_unlock_fd_resume (void *carg)
-{
-        nlm4_stats                      stat = nlm4_denied;
-        int                             ret = -EFAULT;
-        nfs_user_t                      nfu = {0, };
-        nfs3_call_state_t               *cs = NULL;
-        struct gf_flock                 flock = {0, };
-
-        if (!carg)
-                return ret;
-        gf_log (GF_NLM, GF_LOG_INFO, "enter");
-        cs = (nfs3_call_state_t *)carg;
-        nlm4_check_fh_resolve_status (cs, stat, nlm4err);
-        nfs_request_user_init (&nfu, cs->req);
-        nlm4_lock_to_gf_flock (&flock, &cs->args.nlm4_unlockargs.alock, 0);
-        flock.l_type = F_UNLCK;
-        nfu.lk_owner = flock.l_owner = (uint64_t)nlm_search (cs);
-        ret = nfs_lk (cs->nfsx, cs->vol, &nfu, cs->fd, F_SETLK,
-                      &flock, nlm4svc_unlock_cbk, cs);
-
-        if (ret < 0)
-                stat = nlm4_errno_to_nlm4stat (-ret);
-nlm4err:
-        if (ret < 0) {
-//                nfs3_log_common_res (rpcsvc_request_xid (cs->req), "READ",
-//                                     stat, -ret);
-                gf_log (GF_NLM, GF_LOG_ERROR, "error here");
-                nlm4_generic_reply (cs->req, cs->args.nlm4_unlockargs.cookie,
-                                    stat);
-                nfs3_call_state_wipe (cs);
-        }
-
-        return ret;
-}
 
 int
 nlm4_unlock_resume (void *carg)
@@ -1307,69 +1371,15 @@ rpcerr:
         }
         return ret;
 }
-/*
-int
-nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
-                void *data2)
+
+void
+nlm4svc_sm_notify (struct nlm_sm_status *status)
 {
-        dict_t *options = NULL;
-        struct sockaddr_storage sa;
-        struct sockaddr_in *sin;
-        char *peer, *portstr;
-        int ret = -1;
-        rpc_clnt_t *rpc_clnt;
-        rpc_transport_t *trans = NULL;
-        xlator_t *nfsx;
-        struct nfs_state *nfs = NULL;
-
-        nfsx = data1;
-        trans = data2;
-
-        if (strcmp("socket.NLM", trans->name)|| event != RPCSVC_EVENT_ACCEPT)
-                return 0;
-        else
-                gf_log (GF_NFS, GF_LOG_ERROR, "nlm conn");
-
-        ret = rpc_transport_get_peeraddr (trans, NULL, 0, &sa, sizeof (sa));
-        sin = (struct sockaddr_in *) &sa;
-        peer = inet_ntoa (sin->sin_addr);
-
-        options = dict_new();
-
-        ret = dict_set_str (options, "transport-type", "socket");
-        if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
-                goto err;
-        }
-
-        ret = dict_set_dynstr (options, "remote-host", strdup (peer));
-        if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
-                goto err;
-        }
-
-        ret = gf_asprintf (&portstr, "%d", 5000);
-        if (ret == -1)
-                goto err;
-
-        ret = dict_set_dynstr (options, "remote-port",
-                               portstr);
-        if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
-                goto err;
-        }
-
-        dict_set_str (options, "non-blocking-io", "off");
-
-        rpc_clnt = rpc_clnt_new (options, nfsx->ctx, trans->name);
-        rpc_transport_connect (rpc_clnt->conn.trans, 5000);
-
-        nfs = nfsx->private;
-        nfs->rpc_clnt = rpc_clnt;
-err:
-        return 0;
+        gf_log (GF_NLM, GF_LOG_INFO, "sm_notify: %s, state: %d",
+                status->mon_name,
+                status->state);
 }
-*/
+
 
 int ipv6_addr_equal(const struct in6_addr *a1,
                     const struct in6_addr *a2)
@@ -1517,7 +1527,9 @@ nlm4_init_state (xlator_t *nfsx)
 */
 }
 
-extern rpcsvc_program_t *
+extern void *nsm_thread (void *argv);
+
+rpcsvc_program_t *
 nlm4svc_init(xlator_t *nfsx)
 {
         struct nfs3_state *ns = NULL;
@@ -1525,6 +1537,7 @@ nlm4svc_init(xlator_t *nfsx)
         dict_t *options = NULL;
         int ret = -1;
         char *portstr = NULL;
+        pthread_t thr;
 
         nfs = (struct nfs_state*)nfsx->private;
 
@@ -1573,6 +1586,8 @@ nlm4svc_init(xlator_t *nfsx)
         ns->nlm_cbk_clnt = dict_new();
         INIT_LIST_HEAD(&ns->nlm_client_list);
         rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
+
+        pthread_create (&thr, NULL, nsm_thread, (void*)NULL);
 
         return &nlm4prog;
 err:

@@ -150,14 +150,14 @@ struct nlm4_shareres {
 	int sequence;
 };
 typedef struct nlm4_shareres nlm4_shareres;
-
+/*
 struct nlm_sm_status {
 	char *mon_name;
 	int state;
 	char priv[16];
 };
 typedef struct nlm_sm_status nlm_sm_status;
-
+*/
 #define NLM4_NULL 0
 #define NLM4_TEST 1
 #define NLM4_LOCK 2
@@ -201,7 +201,6 @@ extern  bool_t xdr_nlm4_cancargs (XDR *, nlm4_cancargs*);
 extern  bool_t xdr_nlm4_unlockargs (XDR *, nlm4_unlockargs*);
 extern  bool_t xdr_nlm4_shareargs (XDR *, nlm4_shareargs*);
 extern  bool_t xdr_nlm4_shareres (XDR *, nlm4_shareres*);
-extern  bool_t xdr_nlm_sm_status (XDR *, nlm_sm_status*);
 
 #else /* K&R C */
 extern bool_t xdr_netobj ();
@@ -221,7 +220,6 @@ extern bool_t xdr_nlm4_cancargs ();
 extern bool_t xdr_nlm4_unlockargs ();
 extern bool_t xdr_nlm4_shareargs ();
 extern bool_t xdr_nlm4_shareres ();
-extern bool_t xdr_nlm_sm_status ();
 
 #endif /* K&R C */
 

@@ -209,6 +209,7 @@ xdr_nlm4_shareres (XDR *xdrs, nlm4_shareres *objp)
 	return TRUE;
 }
 
+/*
 bool_t
 xdr_nlm_sm_status (XDR *xdrs, nlm_sm_status *objp)
 {
@@ -220,3 +221,4 @@ xdr_nlm_sm_status (XDR *xdrs, nlm_sm_status *objp)
 		 return FALSE;
 	return TRUE;
 }
+*/

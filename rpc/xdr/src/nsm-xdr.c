@@ -3,7 +3,7 @@
  * It was generated using rpcgen.
  */
 
-#include "nsm.h"
+#include "nsm-xdr.h"
 
 bool_t
 xdr_sm_name (XDR *xdrs, sm_name *objp)

@@ -158,7 +158,6 @@ typedef union args_ {
         nlm4_unlockargs nlm4_unlockargs;
         nlm4_shareargs nlm4_shareargs;
         nlm4_shareres nlm4_shareres;
-        nlm_sm_status nlm_sm_status;
 } args;
 
 
