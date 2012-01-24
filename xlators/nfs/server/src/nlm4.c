@@ -730,6 +730,12 @@ nlm4_establish_callback (void *csarg)
                 goto err;
         }
 
+        ret = dict_set_str (options, "auth-null", "on");
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
+                goto err;
+        }
+
         rpc_clnt = rpc_clnt_new (options, cs->nfsx->ctx, "NLM-client");
         if (rpc_clnt == NULL) {
                 gf_log (GF_NLM, GF_LOG_ERROR, "rpc_clnt NULL");

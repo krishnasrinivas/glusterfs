@@ -189,6 +189,7 @@ typedef struct rpc_clnt {
 
         glusterfs_ctx_t       *ctx;
         int                   refcount;
+        int                   auth_null;
 } rpc_clnt_t;
 
 
