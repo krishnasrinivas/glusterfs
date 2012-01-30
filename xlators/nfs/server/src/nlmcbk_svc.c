@@ -58,11 +58,6 @@ nlmcbk_program_0(struct svc_req *rqstp, register SVCXPRT *transp)
 		return;
 	}
 	result = (*local)((char *)&argument, rqstp);
-/*
-	if (result != NULL && !svc_sendreply(transp, (xdrproc_t) _xdr_result, result)) {
-		svcerr_systemerr (transp);
-	}
-*/
 	if (!svc_sendreply(transp, (xdrproc_t) _xdr_result, result)) {
 		svcerr_systemerr (transp);
 	}

@@ -66,6 +66,7 @@ typedef struct nlm_client {
         struct list_head nlm_clients;
         struct list_head fdes;
         struct rpc_clnt *rpc_clnt;
+        char *caller_name;
 } nlm_client_t;
 
 typedef struct nlm_fde {
