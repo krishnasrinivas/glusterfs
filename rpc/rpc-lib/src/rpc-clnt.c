@@ -837,6 +837,23 @@ out:
         return;
 }
 
+int
+rpc_clnt_is_connected (rpc_clnt_connection_t *conn)
+{
+        int connected = 0;
+        if (!conn) {
+                goto out;
+        }
+
+        pthread_mutex_lock (&conn->lock);
+        {
+                connected = conn->connected;
+        }
+        pthread_mutex_unlock (&conn->lock);
+
+out:
+        return connected;
+}
 
 int
 rpc_clnt_notify (rpc_transport_t *trans, void *mydata,

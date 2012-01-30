@@ -32,6 +32,97 @@ typedef ssize_t (*nlm4_serializer) (struct iovec outmsg, void *args);
 extern void
 nfs3_call_state_wipe (nfs3_call_state_t *cs);
 
+struct list_head nlm_client_list;
+gf_lock_t nlm_client_list_lk;
+
+int rpc_cmp_addr(const struct sockaddr *sap1,
+                 const struct sockaddr *sap2);
+
+
+rpc_clnt_t *
+nlm_get_rpc_clnt (struct sockaddr_storage sa)
+{
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+        rpc_clnt_t *rpc_clnt = NULL;
+
+        LOCK (&nlm_client_list_lk);
+        list_for_each_entry (nlmclnt, &nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr *)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+        if (!nlmclnt_found)
+                goto ret;
+        if (nlmclnt->rpc_clnt)
+                rpc_clnt = rpc_clnt_ref (nlmclnt->rpc_clnt);
+ret:
+        UNLOCK (&nlm_client_list_lk);
+        return rpc_clnt;
+}
+
+int
+nlm_set_rpc_clnt (rpc_clnt_t *rpc_clnt)
+{
+        nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
+        struct sockaddr_storage sa;
+        int ret = -1;
+        rpc_clnt_t *rpc_clnt_old = NULL;
+
+        rpc_transport_get_peeraddr (rpc_clnt->conn.trans, NULL, 0, &sa,
+                                    sizeof (sa));
+
+        LOCK (&nlm_client_list_lk);
+        list_for_each_entry (nlmclnt, &nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr *)&sa)) {
+                        nlmclnt_found = 1;
+                        break;
+                }
+        }
+        if (!nlmclnt_found)
+                goto ret;
+        rpc_clnt_old = nlmclnt->rpc_clnt;
+        nlmclnt->rpc_clnt = rpc_clnt_ref (rpc_clnt);
+        ret = 0;
+ret:
+        UNLOCK (&nlm_client_list_lk);
+        if (rpc_clnt_old)
+                rpc_clnt_unref (rpc_clnt_old);
+        return ret;
+}
+
+int
+nlm_unset_rpc_clnt (rpc_clnt_t *rpc)
+{
+        nlm_client_t *nlmclnt = NULL;
+        struct sockaddr_storage sa;
+        rpc_clnt_t *rpc_clnt = NULL;
+
+        rpc_transport_get_peeraddr (rpc->conn.trans, NULL, 0, &sa,
+                                    sizeof (sa));
+
+        LOCK (&nlm_client_list_lk);
+        list_for_each_entry (nlmclnt, &nlm_client_list, nlm_clients) {
+                if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
+                                 (struct sockaddr *)&sa)) {
+                        rpc_clnt = nlmclnt->rpc_clnt;
+                        nlmclnt->rpc_clnt = NULL;
+                        break;
+                }
+        }
+        UNLOCK (&nlm_client_list_lk);
+        if (rpc_clnt == NULL) {
+                return -1;
+        }
+        if (rpc_clnt)
+                rpc_clnt_unref (rpc_clnt);
+        return 0;
+}
+
 nfsstat3
 nlm4_errno_to_nlm4stat (int errnum)
 {
@@ -120,9 +211,6 @@ nfs3_fh_to_xlator (struct nfs3_state *nfs3, struct nfs3_fh *fh);
                         goto erlabl;                                    \
                 }                                                       \
         } while (0)                                                     \
-
-int rpc_cmp_addr(const struct sockaddr *sap1,
-                 const struct sockaddr *sap2);
 
 
 nfs3_call_state_t *
@@ -336,9 +424,8 @@ nlm_search (nfs3_call_state_t *cs)
         int nlmclnt_found = 0;
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
-
         list_for_each_entry (nlmclnt,
-                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                             &nlm_client_list, nlm_clients) {
                 if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
                                  (struct sockaddr*)&sa)) {
                         nlmclnt_found = 1;
@@ -675,6 +762,32 @@ nlm4svc_send_granted_cbk (struct rpc_req *req, struct iovec *iov, int count,
         return 0;
 }
 
+int nlm_rpcclnt_notify (struct rpc_clnt *rpc, void *mydata,
+                        rpc_clnt_event_t fn, void *data)
+{
+        nlm_condmutex_t *cm;
+        int ret;
+        cm = mydata;
+        gf_log (GF_NLM, GF_LOG_INFO, "notify %d", fn);
+        switch (fn) {
+        case RPC_CLNT_CONNECT:
+                gf_log (GF_NLM, GF_LOG_INFO, "connected!");
+                ret = pthread_cond_broadcast (&cm->cond);
+                if (ret!=0)
+                        gf_log (GF_NLM, GF_LOG_ERROR, "cond_broadcasr error %s",
+                                strerror (errno));
+                break;
+        case RPC_CLNT_MSG:
+                break;
+        case RPC_CLNT_DISCONNECT:
+                gf_log (GF_NLM, GF_LOG_INFO, "DISconnected!");
+                nlm_unset_rpc_clnt(rpc);
+/* FIXME: what about destrouying the transport */
+                break;
+        }
+        return 0;
+}
+
 void
 nlm4svc_send_granted (nfs3_call_state_t *cs);
 
@@ -683,10 +796,10 @@ nlm4_establish_callback (void *csarg)
 {
         nfs3_call_state_t *cs;
         struct sockaddr_storage sa;
-        struct sockaddr_in *sin;
+        struct sockaddr *sockaddr;
         dict_t *options = NULL;
-        char *peerip = NULL, *portstr;
-        rpc_clnt_t *rpc_clnt;
+        char peerip[INET6_ADDRSTRLEN+1], *portstr;
+        rpc_clnt_t *rpc_clnt = NULL;
         int port;
         int ret;
 
@@ -696,9 +809,25 @@ nlm4_establish_callback (void *csarg)
         nsm_monitor (cs->args.nlm4_lockargs.alock.caller_name);
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
-        sin = (struct sockaddr_in*) &sa;
-        peerip = inet_ntoa (sin->sin_addr);
-        port = pmap_getport (sin, NLM_PROGRAM, NLM_V4, IPPROTO_TCP);
+        sockaddr = (struct sockaddr*) &sa;
+        switch (sockaddr->sa_family) {
+        case AF_INET6:
+                inet_ntop (AF_INET6,
+                           &((struct sockaddr_in6 *)sockaddr)->sin6_addr,
+                           peerip, INET6_ADDRSTRLEN+1);
+                break;
+        case AF_INET:
+                inet_ntop (AF_INET,
+                           &((struct sockaddr_in *)sockaddr)->sin_addr,
+                           peerip, INET6_ADDRSTRLEN+1);
+        default:
+                break;
+                /* FIXME: handle the error */
+        }
+
+        /* looks like libc rpc supports only ipv4 */
+        port = pmap_getport ((struct sockaddr_in*)sockaddr, NLM_PROGRAM,
+                             NLM_V4, IPPROTO_TCP);
 
         options = dict_new();
         ret = dict_set_str (options, "transport-type", "socket");
@@ -723,13 +852,13 @@ nlm4_establish_callback (void *csarg)
                 gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
                 goto err;
         }
-
+/*
         ret = dict_set_str (options, "non-blocking-io", "off");
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
                 goto err;
         }
-
+*/
         ret = dict_set_str (options, "auth-null", "on");
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
@@ -741,20 +870,37 @@ nlm4_establish_callback (void *csarg)
                 gf_log (GF_NLM, GF_LOG_ERROR, "rpc_clnt NULL");
                 goto err;
         }
+        nlm_condmutex_t *cm;
+        cm = GF_CALLOC (1, sizeof(*cm), gf_nfs_mt_nlm4_state);
+        pthread_mutex_init (&cm->mutex, NULL);
+        pthread_cond_init (&cm->cond, NULL);
+        ret = rpc_clnt_register_notify (rpc_clnt, nlm_rpcclnt_notify,
+                                        cm);
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR,"rpc_clnt_register_connect error");
+                goto err;
+        }
         ret = rpc_transport_connect (rpc_clnt->conn.trans, port);
+/*
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "rpc_transport_connect error");
                 goto err;
         }
+*/
+        gf_log (GF_NLM, GF_LOG_INFO, "going to wait now!");
+        pthread_cond_wait (&cm->cond, &cm->mutex);
+        gf_log (GF_NLM, GF_LOG_INFO, "continuing!");
+        pthread_mutex_destroy (&cm->mutex);
+        GF_FREE (cm);
         rpc_clnt_set_connected (&rpc_clnt->conn);
-        ret = dict_set_static_ptr (cs->nfs3state->nlm_cbk_clnt, peerip,
-                                   rpc_clnt);
+        ret = nlm_set_rpc_clnt (rpc_clnt);
         if (ret == -1) {
                 gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_ptr error");
                 goto err;
         }
         nlm4svc_send_granted (cs);
 err:
+        rpc_clnt_unref (rpc_clnt);
         return NULL;
 }
 
@@ -768,22 +914,35 @@ nlm4svc_send_granted (nfs3_call_state_t *cs)
         struct iobuf *iobuf;
         struct iobref *iobref;
         struct nfs_state *nfs;
-        char *peerip;
+        char peerip[INET6_ADDRSTRLEN+1];
         pthread_t thr;
         struct sockaddr_storage sa;
-        struct sockaddr_in *sin;
+        struct sockaddr *sockaddr;
 
         nfs = cs->nfsx->private;
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
-        sin = (struct sockaddr_in *) &sa;
-        peerip = inet_ntoa (sin->sin_addr);
-        ret = dict_get_ptr (cs->nfs3state->nlm_cbk_clnt, peerip, (void *) &rpc_clnt);
-        if (ret != 0) {
+        sockaddr = (struct sockaddr*) &sa;
+        switch (sockaddr->sa_family) {
+        case AF_INET6:
+                inet_ntop (AF_INET6,
+                           &((struct sockaddr_in6 *)sockaddr)->sin6_addr,
+                           peerip, INET6_ADDRSTRLEN+1);
+                break;
+        case AF_INET:
+                inet_ntop (AF_INET,
+                           &((struct sockaddr_in *)sockaddr)->sin_addr,
+                           peerip, INET6_ADDRSTRLEN+1);
+        default:
+                break;
+                /* FIXME: handle the error */
+        }
+
+        rpc_clnt = nlm_get_rpc_clnt (sa);
+        if (rpc_clnt == NULL) {
                 pthread_create (&thr, NULL, nlm4_establish_callback, (void*)cs);
                 return;
         }
-//        rpc_clnt = cs->nfs3state->rpc_clnt;
 
         testargs.cookie = cs->args.nlm4_lockargs.cookie;
         testargs.exclusive = cs->args.nlm4_lockargs.exclusive;
@@ -821,6 +980,7 @@ nlm4svc_send_granted (nfs3_call_state_t *cs)
                 goto ret;
         }
 ret:
+        rpc_clnt_unref (rpc_clnt);
         nfs3_call_state_wipe (cs);
         return;
 }
@@ -837,8 +997,9 @@ nlm_search_and_delete (nfs3_call_state_t *cs)
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
 
+        LOCK (&nlm_client_list_lk);
         list_for_each_entry (nlmclnt,
-                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                             &nlm_client_list, nlm_clients) {
                 if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
                                  (struct sockaddr*)&sa)) {
                         nlmclnt_found = 1;
@@ -847,9 +1008,9 @@ nlm_search_and_delete (nfs3_call_state_t *cs)
         }
 
         if (!nlmclnt_found)
-                return;
+                goto ret;
 
-        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
+        gf_log (GF_NLM, GF_LOG_INFO, "nlm clnt found");
 
         list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
                 if (fde->fd == cs->fd) {
@@ -859,12 +1020,14 @@ nlm_search_and_delete (nfs3_call_state_t *cs)
         }
 
         if (!fde_found)
-                return;
+                goto ret;
         gf_log (GF_NLM, GF_LOG_ERROR, "deleting fd from list");
         list_del (&fde->fde_list);
+
+ret:
+        UNLOCK (&nlm_client_list_lk);
         fd_unref (fde->fd);
         GF_FREE (fde);
-
         return;
 }
 
@@ -908,8 +1071,9 @@ nlm_search_and_add (nfs3_call_state_t *cs)
 
         rpc_transport_get_peeraddr (cs->trans, NULL, 0, &sa, sizeof (sa));
 
+        LOCK (&nlm_client_list_lk);
         list_for_each_entry (nlmclnt,
-                             &cs->nfs3state->nlm_client_list, nlm_clients) {
+                             &nlm_client_list, nlm_clients) {
                 if (rpc_cmp_addr((struct sockaddr*)&nlmclnt->sa,
                                  (struct sockaddr*)&sa)) {
                         nlmclnt_found = 1;
@@ -917,10 +1081,12 @@ nlm_search_and_add (nfs3_call_state_t *cs)
                 }
         }
 
-        if (!nlmclnt_found)
-                return NULL;
+        if (!nlmclnt_found) {
+                nlmclnt = NULL;
+                goto ret;
+        }
 
-        gf_log (GF_NLM, GF_LOG_ERROR, "nlm clnt found");
+        gf_log (GF_NLM, GF_LOG_INFO, "nlm clnt found");
         list_for_each_entry (fde, &nlmclnt->fdes, fde_list) {
                 if (fde->fd == cs->fd) {
                         fde_found = 1;
@@ -929,14 +1095,15 @@ nlm_search_and_add (nfs3_call_state_t *cs)
         }
 
         if (fde_found)
-                return nlmclnt;
+                goto ret;
 
-        gf_log (GF_NLM, GF_LOG_ERROR, "adding fd to list");
+        gf_log (GF_NLM, GF_LOG_INFO, "adding fd to list");
         fde = GF_CALLOC (1, sizeof (*fde), gf_nfs_mt_nlm4_state);
 
         fde->fd = fd_ref (cs->fd);
         list_add (&fde->fde_list, &nlmclnt->fdes);
-
+ret:
+        UNLOCK (&nlm_client_list_lk);
         return nlmclnt;
 }
 
@@ -1432,15 +1599,11 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                     void *data2)
 {
         struct sockaddr_storage sa;
-        struct sockaddr_in *sin;
-        char *peer;
         int ret = -1;
         rpc_transport_t *trans = NULL;
-        xlator_t *nfsx;
-        struct nfs_state *nfs = NULL;
         nlm_client_t *nlmclnt = NULL;
+        int nlmclnt_found = 0;
 
-        nfsx = data1;
         trans = data2;
 
         if (event != RPCSVC_EVENT_ACCEPT)
@@ -1450,18 +1613,19 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                 return 0;
 
         ret = rpc_transport_get_peeraddr (trans, NULL, 0, &sa, sizeof (sa));
-        sin = (struct sockaddr_in *) &sa;
-        peer = inet_ntoa (sin->sin_addr);
 
-        nfs = nfs_state (nfsx);
-
-        list_for_each_entry (nlmclnt, &nfs->nfs3state->nlm_client_list,
+        LOCK (&nlm_client_list_lk);
+        list_for_each_entry (nlmclnt, &nlm_client_list,
                              nlm_clients) {
                 if (rpc_cmp_addr((struct sockaddr*) &nlmclnt->sa,
                                  (struct sockaddr*)&sa)) {
-                        return 0;
+                        nlmclnt_found = 1;
                 }
         }
+        UNLOCK (&nlm_client_list_lk);
+
+        if (nlmclnt_found)
+                return 0;
 
         nlmclnt = GF_CALLOC (1, sizeof(*nlmclnt), gf_nfs_mt_nlm4_state);
         if (nlmclnt == NULL) {
@@ -1473,7 +1637,11 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
         INIT_LIST_HEAD(&nlmclnt->nlm_clients);
         nlmclnt->sa = sa;
         nlmclnt->uniq = uniq++;
-        list_add (&nlmclnt->nlm_clients, &nfs->nfs3state->nlm_client_list);
+        gf_log (GF_NLM, GF_LOG_INFO, "accepted new client");
+
+        LOCK (&nlm_client_list_lk);
+        list_add (&nlmclnt->nlm_clients, &nlm_client_list);
+        UNLOCK (&nlm_client_list_lk);
 
         return 0;
 }
@@ -1589,7 +1757,8 @@ nlm4svc_init(xlator_t *nfsx)
                 goto err;
         }
         ns->nlm_cbk_clnt = dict_new();
-        INIT_LIST_HEAD(&ns->nlm_client_list);
+        INIT_LIST_HEAD(&nlm_client_list);
+        LOCK_INIT (&nlm_client_list_lk);
         rpcsvc_register_notify (nfs->rpcsvc, nlm4svc_notify, nfsx);
 
         pthread_create (&thr, NULL, nsm_thread, (void*)NULL);

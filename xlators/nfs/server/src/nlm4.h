@@ -65,11 +65,17 @@ typedef struct nlm_client {
         pid_t uniq;
         struct list_head nlm_clients;
         struct list_head fdes;
+        struct rpc_clnt *rpc_clnt;
 } nlm_client_t;
 
 typedef struct nlm_fde {
         struct list_head fde_list;
         fd_t *fd;
 } nlm_fde_t;
+
+typedef struct {
+        pthread_cond_t cond;
+        pthread_mutex_t mutex;
+} nlm_condmutex_t;
 
 #endif

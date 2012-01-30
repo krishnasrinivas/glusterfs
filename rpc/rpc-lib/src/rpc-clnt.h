@@ -233,7 +233,7 @@ rpc_clnt_unref (struct rpc_clnt *rpc);
 void rpc_clnt_set_connected (rpc_clnt_connection_t *conn);
 
 void rpc_clnt_unset_connected (rpc_clnt_connection_t *conn);
-
+int rpc_clnt_is_connected (rpc_clnt_connection_t *conn);
 void rpc_clnt_reconnect (void *trans_ptr);
 
 void rpc_clnt_reconfig (struct rpc_clnt *rpc, struct rpc_clnt_config *config);
