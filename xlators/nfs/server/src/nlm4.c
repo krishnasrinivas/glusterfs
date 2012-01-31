@@ -35,9 +35,90 @@ nfs3_call_state_wipe (nfs3_call_state_t *cs);
 struct list_head nlm_client_list;
 gf_lock_t nlm_client_list_lk;
 
+static int nlm_uniq = 1;
+
 int rpc_cmp_addr(const struct sockaddr *sap1,
                  const struct sockaddr *sap2);
 
+void
+nlm4_prep_nlm4_testargs (nlm4_testargs *args, struct nfs3_fh *fh,
+                         nlm4_lkowner_t *oh, char *cookiebytes)
+{
+        memset (args, 0, sizeof (*args));
+        args->alock.fh.n_bytes = (void *)fh;
+        args->alock.oh.n_bytes = (void *)oh;
+        args->cookie.n_bytes = (void *)cookiebytes;
+}
+
+void
+nlm4_prep_nlm4_lockargs (nlm4_lockargs *args, struct nfs3_fh *fh,
+                         nlm4_lkowner_t *oh, char *cookiebytes)
+{
+        memset (args, 0, sizeof (*args));
+        args->alock.fh.n_bytes = (void *)fh;
+        args->alock.oh.n_bytes = (void *)oh;
+        args->cookie.n_bytes = (void *)cookiebytes;
+}
+
+void
+nlm4_prep_nlm4_cancargs (nlm4_cancargs *args, struct nfs3_fh *fh,
+                           nlm4_lkowner_t *oh, char *cookiebytes)
+{
+        memset (args, 0, sizeof (*args));
+        args->alock.fh.n_bytes = (void *)fh;
+        args->alock.oh.n_bytes = (void *)oh;
+        args->cookie.n_bytes = (void *)cookiebytes;
+}
+
+void
+nlm4_prep_nlm4_unlockargs (nlm4_unlockargs *args, struct nfs3_fh *fh,
+                           nlm4_lkowner_t *oh, char *cookiebytes)
+{
+        memset (args, 0, sizeof (*args));
+        args->alock.fh.n_bytes = (void *)fh;
+        args->alock.oh.n_bytes = (void *)oh;
+        args->cookie.n_bytes = (void *)cookiebytes;
+}
+
+int ipv6_addr_equal(const struct in6_addr *a1,
+                    const struct in6_addr *a2)
+{
+	return (((a1->s6_addr32[0] ^ a2->s6_addr32[0]) |
+		 (a1->s6_addr32[1] ^ a2->s6_addr32[1]) |
+		 (a1->s6_addr32[2] ^ a2->s6_addr32[2]) |
+		 (a1->s6_addr32[3] ^ a2->s6_addr32[3])) == 0);
+}
+
+int __rpc_cmp_addr4(const struct sockaddr *sap1,
+                                const struct sockaddr *sap2)
+{
+	const struct sockaddr_in *sin1 = (const struct sockaddr_in *)sap1;
+	const struct sockaddr_in *sin2 = (const struct sockaddr_in *)sap2;
+
+	return sin1->sin_addr.s_addr == sin2->sin_addr.s_addr;
+}
+
+int __rpc_cmp_addr6(const struct sockaddr *sap1,
+                    const struct sockaddr *sap2)
+{
+	const struct sockaddr_in6 *sin1 = (const struct sockaddr_in6 *)sap1;
+	const struct sockaddr_in6 *sin2 = (const struct sockaddr_in6 *)sap2;
+	return ipv6_addr_equal(&sin1->sin6_addr, &sin2->sin6_addr);
+}
+
+int rpc_cmp_addr(const struct sockaddr *sap1,
+                 const struct sockaddr *sap2)
+{
+	if (sap1->sa_family == sap2->sa_family) {
+		switch (sap1->sa_family) {
+		case AF_INET:
+			return __rpc_cmp_addr4(sap1, sap2);
+		case AF_INET6:
+			return __rpc_cmp_addr6(sap1, sap2);
+		}
+	}
+	return 0;
+}
 
 rpc_clnt_t *
 nlm_get_rpc_clnt (struct sockaddr_storage sa)
@@ -137,6 +218,15 @@ nlm4_errno_to_nlm4stat (int errnum)
         switch (errnum) {
         case 0:
                 stat = nlm4_granted;
+                break;
+        case EROFS:
+                stat = nlm4_rofs;
+                break;
+        case ESTALE:
+                stat = nlm4_stale_fh;
+                break;
+        case ENOLCK:
+                stat = nlm4_failed;
                 break;
         default:
                 stat = nlm4_denied;
@@ -383,7 +473,7 @@ int nsm_monitor(char *host)
         clnt = clnt_create("localhost", SM_PROG, SM_VERS, "tcp");
         if(!clnt)
         {
-                gf_log (GF_NFS, GF_LOG_ERROR, "Clnt_create()");
+                gf_log (GF_NLM, GF_LOG_ERROR, "Clnt_create()");
                 goto out;
         }
 
@@ -392,13 +482,13 @@ int nsm_monitor(char *host)
                         (xdrproc_t) xdr_sm_stat_res, (caddr_t) & res, tout);
         if(ret != RPC_SUCCESS)
         {
-                gf_log (GF_NFS, GF_LOG_ERROR, "clnt_call(): %s",
+                gf_log (GF_NLM, GF_LOG_ERROR, "clnt_call(): %s",
                         clnt_sperrno(ret));
                 goto out;
         }
         if(res.res_stat != STAT_SUCC)
         {
-                gf_log (GF_NFS, GF_LOG_ERROR, "clnt_call(): %s",
+                gf_log (GF_NLM, GF_LOG_ERROR, "clnt_call(): %s",
                         clnt_sperrno(ret));
                 goto out;
         }
@@ -430,7 +520,6 @@ nlm_get_uniq (nfs3_call_state_t *cs)
         UNLOCK(&nlm_client_list_lk);
         return nlm_uniq;
 }
-
 
 nlm_client_t *
 nlm_search (nfs3_call_state_t *cs)
@@ -521,7 +610,7 @@ nlm4svc_null (rpcsvc_request_t *req)
         struct iovec    dummyvec = {0, };
 
         if (!req) {
-                gf_log (GF_MNT, GF_LOG_ERROR, "Got NULL request!");
+                gf_log (GF_NLM, GF_LOG_ERROR, "Got NULL request!");
                 return 0;
         }
         rpcsvc_submit_generic (req, &dummyvec, 1,  NULL, 0, NULL);
@@ -654,46 +743,6 @@ nlm4err:
         return ret;
 }
 
-void
-nlm4_prep_nlm4_testargs (nlm4_testargs *args, struct nfs3_fh *fh,
-                         nlm4_lkowner_t *oh, char *cookiebytes)
-{
-        memset (args, 0, sizeof (*args));
-        args->alock.fh.n_bytes = (void *)fh;
-        args->alock.oh.n_bytes = (void *)oh;
-        args->cookie.n_bytes = (void *)cookiebytes;
-}
-
-void
-nlm4_prep_nlm4_lockargs (nlm4_lockargs *args, struct nfs3_fh *fh,
-                         nlm4_lkowner_t *oh, char *cookiebytes)
-{
-        memset (args, 0, sizeof (*args));
-        args->alock.fh.n_bytes = (void *)fh;
-        args->alock.oh.n_bytes = (void *)oh;
-        args->cookie.n_bytes = (void *)cookiebytes;
-}
-
-void
-nlm4_prep_nlm4_cancargs (nlm4_cancargs *args, struct nfs3_fh *fh,
-                           nlm4_lkowner_t *oh, char *cookiebytes)
-{
-        memset (args, 0, sizeof (*args));
-        args->alock.fh.n_bytes = (void *)fh;
-        args->alock.oh.n_bytes = (void *)oh;
-        args->cookie.n_bytes = (void *)cookiebytes;
-}
-
-void
-nlm4_prep_nlm4_unlockargs (nlm4_unlockargs *args, struct nfs3_fh *fh,
-                           nlm4_lkowner_t *oh, char *cookiebytes)
-{
-        memset (args, 0, sizeof (*args));
-        args->alock.fh.n_bytes = (void *)fh;
-        args->alock.oh.n_bytes = (void *)oh;
-        args->cookie.n_bytes = (void *)cookiebytes;
-}
-
 int
 nlm4svc_test (rpcsvc_request_t *req)
 {
@@ -716,7 +765,7 @@ nlm4svc_test (rpcsvc_request_t *req)
         nlm4_prep_nlm4_testargs (&cs->args.nlm4_testargs, &fh, &cs->lkowner,
                                  cs->cookiebytes);
         if (xdr_to_nlm4_testargs(req->msg[0], &cs->args.nlm4_testargs) <= 0) {
-                gf_log (GF_NFS3, GF_LOG_ERROR, "Error decoding args");
+                gf_log (GF_NLM, GF_LOG_ERROR, "Error decoding args");
                 rpcsvc_request_seterr (req, GARBAGE_ARGS);
                 goto rpcerr;
         }
@@ -838,13 +887,13 @@ nlm4_establish_callback (void *csarg)
         options = dict_new();
         ret = dict_set_str (options, "transport-type", "socket");
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_str error");
                 goto err;
         }
 
         ret = dict_set_dynstr (options, "remote-host", strdup (peerip));
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_str error");
                 goto err;
         }
 
@@ -855,12 +904,12 @@ nlm4_establish_callback (void *csarg)
         ret = dict_set_dynstr (options, "remote-port",
                                portstr);
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_dynstr error");
                 goto err;
         }
         ret = dict_set_str (options, "auth-null", "on");
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_dynstr error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_dynstr error");
                 goto err;
         }
 
@@ -870,13 +919,13 @@ nlm4_establish_callback (void *csarg)
                 goto err;
         }
         nlm_condmutex_t *cm;
-        cm = GF_CALLOC (1, sizeof(*cm), gf_nfs_mt_nlm4_state);
+        cm = GF_CALLOC (1, sizeof(*cm), gf_nfs_mt_nlm4_cm);
         pthread_mutex_init (&cm->mutex, NULL);
         pthread_cond_init (&cm->cond, NULL);
         ret = rpc_clnt_register_notify (rpc_clnt, nlm_rpcclnt_notify,
                                         cm);
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR,"rpc_clnt_register_connect error");
+                gf_log (GF_NLM, GF_LOG_ERROR,"rpc_clnt_register_connect error");
                 goto err;
         }
         ret = rpc_transport_connect (rpc_clnt->conn.trans, port);
@@ -886,7 +935,7 @@ nlm4_establish_callback (void *csarg)
         rpc_clnt_set_connected (&rpc_clnt->conn);
         ret = nlm_set_rpc_clnt (rpc_clnt, caller_name);
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_ptr error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_ptr error");
                 goto err;
         }
         nlm4svc_send_granted (cs);
@@ -1051,34 +1100,6 @@ ret:
         return;
 }
 
-int
-nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                  int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
-{
-        nlm4_stats                      stat = nlm4_denied;
-        nfs3_call_state_t              *cs = NULL;
-
-        cs = frame->local;
-
-        if (op_ret == -1) {
-                nlm_search_and_delete (cs);
-                stat = nlm4_errno_to_nlm4stat (op_errno);
-                goto err;
-        } else
-                stat = nlm4_granted;
-
-err:
-        if (cs->args.nlm4_lockargs.block) {
-                cs->frame = copy_frame (frame);
-                nlm4svc_send_granted (cs);
-        } else {
-                nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
-                                    stat);
-                nfs3_call_state_wipe (cs);
-        }
-        return 0;
-}
-
 nlm_client_t *
 nlm_search_and_add (nfs3_call_state_t *cs)
 {
@@ -1115,13 +1136,41 @@ nlm_search_and_add (nfs3_call_state_t *cs)
         if (fde_found)
                 goto ret;
 
-        fde = GF_CALLOC (1, sizeof (*fde), gf_nfs_mt_nlm4_state);
+        fde = GF_CALLOC (1, sizeof (*fde), gf_nfs_mt_nlm4_fde);
 
         fde->fd = fd_ref (cs->fd);
         list_add (&fde->fde_list, &nlmclnt->fdes);
 ret:
         UNLOCK (&nlm_client_list_lk);
         return nlmclnt;
+}
+
+int
+nlm4svc_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                  int32_t op_ret, int32_t op_errno, struct gf_flock *flock)
+{
+        nlm4_stats                      stat = nlm4_denied;
+        nfs3_call_state_t              *cs = NULL;
+
+        cs = frame->local;
+
+        if (op_ret == -1) {
+                nlm_search_and_delete (cs);
+                stat = nlm4_errno_to_nlm4stat (op_errno);
+                goto err;
+        } else
+                stat = nlm4_granted;
+
+err:
+        if (cs->args.nlm4_lockargs.block) {
+                cs->frame = copy_frame (frame);
+                nlm4svc_send_granted (cs);
+        } else {
+                nlm4_generic_reply (cs->req, cs->args.nlm4_lockargs.cookie,
+                                    stat);
+                nfs3_call_state_wipe (cs);
+        }
+        return 0;
 }
 
 int
@@ -1221,7 +1270,7 @@ nlm4svc_lock (rpcsvc_request_t *req)
         nlm4_prep_nlm4_lockargs (&cs->args.nlm4_lockargs, &cs->lockfh,
                                  &cs->lkowner, cs->cookiebytes);
         if (xdr_to_nlm4_lockargs(req->msg[0], &cs->args.nlm4_lockargs) <= 0) {
-                gf_log (GF_NFS3, GF_LOG_ERROR, "Error decoding args");
+                gf_log (GF_NLM3, GF_LOG_ERROR, "Error decoding args");
                 rpcsvc_request_seterr (req, GARBAGE_ARGS);
                 goto rpcerr;
         }
@@ -1417,7 +1466,7 @@ nlm4svc_cancel (rpcsvc_request_t *req)
         nlm4_prep_nlm4_cancargs (&cs->args.nlm4_cancargs, &fh, &cs->lkowner,
                                    cs->cookiebytes);
         if (xdr_to_nlm4_cancelargs(req->msg[0], &cs->args.nlm4_cancargs) <= 0) {
-                gf_log (GF_NFS3, GF_LOG_ERROR, "Error decoding args");
+                gf_log (GF_NLM3, GF_LOG_ERROR, "Error decoding args");
                 rpcsvc_request_seterr (req, GARBAGE_ARGS);
                 goto rpcerr;
         }
@@ -1445,8 +1494,6 @@ rpcerr:
         }
         return ret;
 }
-
-
 
 int
 nlm4_unlock_resume (void *carg)
@@ -1506,7 +1553,7 @@ nlm4svc_unlock (rpcsvc_request_t *req)
                                    cs->cookiebytes);
         if (xdr_to_nlm4_unlockargs(req->msg[0], &cs->args.nlm4_unlockargs) <= 0)
         {
-                gf_log (GF_NFS3, GF_LOG_ERROR, "Error decoding args");
+                gf_log (GF_NLM3, GF_LOG_ERROR, "Error decoding args");
                 rpcsvc_request_seterr (req, GARBAGE_ARGS);
                 goto rpcerr;
         }
@@ -1544,49 +1591,6 @@ nlm4svc_sm_notify (struct nlm_sm_status *status)
         nlm_cleanup_fds (status->mon_name);
 }
 
-
-int ipv6_addr_equal(const struct in6_addr *a1,
-                    const struct in6_addr *a2)
-{
-	return (((a1->s6_addr32[0] ^ a2->s6_addr32[0]) |
-		 (a1->s6_addr32[1] ^ a2->s6_addr32[1]) |
-		 (a1->s6_addr32[2] ^ a2->s6_addr32[2]) |
-		 (a1->s6_addr32[3] ^ a2->s6_addr32[3])) == 0);
-}
-
-int __rpc_cmp_addr4(const struct sockaddr *sap1,
-                                const struct sockaddr *sap2)
-{
-	const struct sockaddr_in *sin1 = (const struct sockaddr_in *)sap1;
-	const struct sockaddr_in *sin2 = (const struct sockaddr_in *)sap2;
-
-	return sin1->sin_addr.s_addr == sin2->sin_addr.s_addr;
-}
-
-int __rpc_cmp_addr6(const struct sockaddr *sap1,
-                    const struct sockaddr *sap2)
-{
-	const struct sockaddr_in6 *sin1 = (const struct sockaddr_in6 *)sap1;
-	const struct sockaddr_in6 *sin2 = (const struct sockaddr_in6 *)sap2;
-	return ipv6_addr_equal(&sin1->sin6_addr, &sin2->sin6_addr);
-}
-
-int rpc_cmp_addr(const struct sockaddr *sap1,
-                 const struct sockaddr *sap2)
-{
-	if (sap1->sa_family == sap2->sa_family) {
-		switch (sap1->sa_family) {
-		case AF_INET:
-			return __rpc_cmp_addr4(sap1, sap2);
-		case AF_INET6:
-			return __rpc_cmp_addr6(sap1, sap2);
-		}
-	}
-	return 0;
-}
-
-int uniq = 1;
-
 int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                     void *data2)
 {
@@ -1606,7 +1610,7 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
 
         ret = rpc_transport_get_peeraddr (trans, NULL, 0, &sa, sizeof (sa));
 
-        nlmclnt = GF_CALLOC (1, sizeof(*nlmclnt), gf_nfs_mt_nlm4_state);
+        nlmclnt = GF_CALLOC (1, sizeof(*nlmclnt), gf_nfs_mt_nlm4_nlmclnt);
         if (nlmclnt == NULL) {
                 gf_log (GF_NLM, GF_LOG_DEBUG, "malloc error");
                 return 0;
@@ -1630,7 +1634,7 @@ int nlm4svc_notify (rpcsvc_t *rpcsvc, void *data1, rpcsvc_event_t event,
                 goto ret;
         }
 
-        nlmclnt->uniq = uniq++;
+        nlmclnt->uniq = nlm_uniq++;
         list_add (&nlmclnt->nlm_clients, &nlm_client_list);
 
 ret:
@@ -1709,26 +1713,26 @@ nlm4svc_init(xlator_t *nfsx)
                 goto err;
         ret = dict_set_str (options, "transport-type", "socket");
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_str error");
                 goto err;
         }
 
         if (nfs->allow_insecure) {
                 ret = dict_set_str (options, "rpc-auth-allow-insecure", "on");
                 if (ret == -1) {
-                        gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                        gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_str error");
                         goto err;
                 }
                 ret = dict_set_str (options, "rpc-auth.ports.insecure", "on");
                 if (ret == -1) {
-                        gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                        gf_log (GF_NLM, GF_LOG_ERROR, "dict_set_str error");
                         goto err;
                 }
         }
 
         rpcsvc_create_listeners (nfs->rpcsvc, options, "NLM");
         if (ret == -1) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "Unable to create listeners");
+                gf_log (GF_NLM, GF_LOG_ERROR, "Unable to create listeners");
                 dict_unref (options);
                 goto err;
         }
